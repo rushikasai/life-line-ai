@@ -1,0 +1,198 @@
+import os
+import re
+from datetime import datetime
+from uuid import uuid4
+
+from openai import OpenAI
+from uagents import Agent, Context, Protocol
+from uagents.experimental.chat_agent.protocol import build_llm_message_history
+from uagents_core.contrib.protocols.chat import (
+    ChatAcknowledgement,
+    ChatMessage,
+    EndSessionContent,
+    MetadataContent,
+    StartSessionContent,
+    TextContent,
+    chat_protocol_spec,
+)
+
+# ==================================================
+# CONFIGURATION
+# ==================================================
+
+# Agentverse injects ASI1_API_KEY and ASI1_BASE_URL into every hosted agent.
+ASI_API_KEY = os.getenv("ASI1_API_KEY")
+ASI_BASE_URL = os.getenv("ASI1_BASE_URL", "https://api.asi1.ai/v1")
+ASI_MODEL = os.getenv("ASI_MODEL", "asi1")
+
+client = (
+    OpenAI(api_key=ASI_API_KEY, base_url=ASI_BASE_URL) if ASI_API_KEY else None
+)
+
+# Agentverse manages the hosted identity:
+# never pass seed, mailbox, port, or endpoint.
+agent = Agent()
+
+# Chat protocol compatible with ASI:One and the Agentverse chat UI.
+protocol = Protocol(spec=chat_protocol_spec)
+
+# ==================================================
+# EMERGENCY DETECTION
+# ==================================================
+
+EMERGENCY_PATTERNS = [
+    r"\bcall emergency\b",
+    r"\bemergency help\b",
+    r"\bneed an ambulance\b",
+    r"\bmedical emergency\b",
+    r"\bcan't breathe\b",
+    r"\bcannot breathe\b",
+    r"\bsevere chest pain\b",
+    r"\bsomeone is unconscious\b",
+    r"\bcall 112\b",
+    r"\bpolice help\b",
+    r"\bfire in\b",
+]
+
+
+def detect_emergency(text: str) -> bool:
+    return any(
+        re.search(pattern, text.lower())
+        for pattern in EMERGENCY_PATTERNS
+    )
+
+
+def emergency_response() -> str:
+    return (
+        "⚠️ If someone is in immediate danger in India, call 112 now.\n\n"
+        "Dialer link: tel:112\n\n"
+        "Open your phone dialer and confirm the call yourself. "
+        "LifeLine AI has not placed a call. Do not wait for an AI "
+        "response during a real emergency."
+    )
+
+# ==================================================
+# AI RESPONSE
+# ==================================================
+
+SYSTEM_PROMPT = (
+    "You are LifeLine AI, a helpful safety and wellbeing assistant. "
+    "Be calm, clear, and practical. Never claim to have called anyone. "
+    "For immediate danger, direct the user to local emergency services. "
+    "You are not a substitute for professional medical or emergency care."
+)
+
+
+def generate_ai_response(ctx: Context, user_text: str) -> str:
+    if detect_emergency(user_text):
+        return emergency_response()
+
+    if client is None:
+        return (
+            "LifeLine AI needs an ASI1 API key. Configure "
+            "ASI1_API_KEY in your Agentverse secrets."
+        )
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        *build_llm_message_history(ctx),
+    ]
+
+    try:
+        response = client.chat.completions.create(
+            model=ASI_MODEL,
+            messages=messages,
+            max_tokens=2048,
+            temperature=0.4,
+        )
+        return (
+            response.choices[0].message.content
+            or "Sorry, I couldn't generate a response."
+        )
+    except Exception as exc:
+        ctx.logger.error(f"ASI1 error: {exc}")
+        return (
+            "AI service is temporarily unavailable. Try again later. "
+            "If this is a real emergency in India, call 112 directly."
+        )
+
+# ==================================================
+# CHAT MESSAGE HELPERS
+# ==================================================
+
+def make_chat_message(text: str) -> ChatMessage:
+    return ChatMessage(
+        timestamp=datetime.utcnow(),
+        msg_id=uuid4(),
+        content=[
+            TextContent(type="text", text=text)
+        ],
+    )
+
+
+def extract_text(msg: ChatMessage) -> str:
+    return "\n".join(
+        item.text
+        for item in msg.content
+        if isinstance(item, TextContent)
+    ).strip()
+
+# ==================================================
+# CHAT + SESSION CONTENT HANDLING
+# ==================================================
+
+@protocol.on_message(ChatMessage)
+async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
+    # Always acknowledge incoming chat messages first.
+    await ctx.send(
+        sender,
+        ChatAcknowledgement(
+            timestamp=datetime.now(),
+            acknowledged_msg_id=msg.msg_id,
+        ),
+    )
+
+    # Recognize optional chat-protocol content types.
+    for item in msg.content:
+        if isinstance(item, StartSessionContent):
+            ctx.logger.info("Session start content received")
+        elif isinstance(item, EndSessionContent):
+            ctx.logger.info("Session end content received")
+        elif isinstance(item, MetadataContent):
+            ctx.logger.info("Metadata content received")
+
+    user_text = extract_text(msg)
+
+    if not user_text:
+        await ctx.send(
+            sender,
+            make_chat_message(
+                "Hi! I'm LifeLine AI. Send a text message to get started."
+            ),
+        )
+        return
+
+    ctx.logger.info(f"Processing message from {sender}")
+
+    answer = generate_ai_response(ctx, user_text)
+
+    await ctx.send(
+        sender,
+        make_chat_message(answer),
+    )
+
+
+@protocol.on_message(ChatAcknowledgement)
+async def handle_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
+    # Acknowledgements from the other side; nothing to do here.
+    pass
+
+
+# ==================================================
+# PROTOCOL REGISTRATION
+# ==================================================
+
+agent.include(protocol, publish_manifest=True)
+
+if __name__ == "__main__":
+    agent.run()
